@@ -1,4 +1,6 @@
+#include <linux/limits.h>
 #define _XOPEN_SOURCE 500
+#include <sys/types.h>
 #include <stdlib.h>
 #include <stddef.h>
 #include <pthread.h>
@@ -22,7 +24,9 @@
 
 
 
-int sub_num = 0; int node_num = 1;
+int global_dir_number = 0;
+
+// Structures
 
 typedef struct item {
   int item_number;
@@ -37,10 +41,8 @@ typedef struct node {
   int vertex;
   int allocated_items[MAX_ITEMS];
   int current_items[MAX_ITEMS];
-  struct node* next;
+  struct node *next;
 } room;
-
-struct node* createNode(int);
 
 typedef struct Graph {
   int numVertices;
@@ -52,8 +54,19 @@ typedef struct Graph {
   struct node** adjLists;
 } graph;
 
+typedef struct path {
+  pthread_t tid;
+  unsigned int seed;
+  int from_room;
+  int to_room;
+  int path_length;
+  int *path_rooms;
+  graph *map;
+} path;
+
 // Declaring all functions
 
+struct node* createNode(int);
 int num_of_subfolders(char *path);
 void game();
 void rand_map(int n, char *path);
@@ -70,7 +83,12 @@ char* path_d_from_command(char *line, char *command);
 char* path_f_from_command(char *line, char *path_d, char *command);
 int int_from_command(char *line, char *command);
 graph *load_game_func(char *path);
-
+path k_thread_method(graph *gr, int threadAmount, int from_room, int to_room);
+void *find_path(void *voidPtr);
+int currentDirectorySubfolders();
+void mapFromDir(char *pathd, char *pathf);
+void recursiveCreateMap(graph *map, char *path, int roomNumber, int *currentRooms);
+void shuffle(int *array, size_t n);
 
 // Create a node
 struct node* createNode(int v) {
@@ -114,6 +132,7 @@ void printGraph(struct Graph* graph) {
   int v;
   for (v = 0; v < graph->numVertices; v++) {
     struct node* temp = graph->adjLists[v];
+    int num = 0;
     printf("\n Room %d: ", v);
     printf("\n Items assigned to this room:");
     for (int k = 0; k < MAX_ITEMS; k++) {
@@ -125,10 +144,11 @@ void printGraph(struct Graph* graph) {
     }
     printf("\n You can go to rooms:");
     while (temp) {
+      num++;
       printf("%d , ", temp->vertex);
       temp = temp->next;
     }
-    printf("\n");
+    printf("\nAdj vertices: %d\n", num);
   }
 
   printf("Items on the map: ");
@@ -146,19 +166,29 @@ int isThereEdge(graph *gr, int v1, int v2) { // If there as en edge between two 
   return 0;
 }
 
+int numberAdjVertices(graph *gr, int n) {
+  int num = 0;
+  room *temp = gr->adjLists[n];
+  while (temp) {
+    num++;
+    temp = temp->next;
+  }
+  return num;
+}
+
 void usage() {
     fprintf(stderr, "USAGE: ./main [-b]\n");
     fprintf(stderr, "b: optional backup-path\n");
 }
 
-/* int walk(const char *name, const struct stat *s, int type, struct FTW *f)
+ int walk(const char *name, const struct stat *s, int type, struct FTW *f)
 {
 	switch (type){
 		case FTW_DNR:
-		case FTW_D: dirs++; break; 
+		case FTW_D: global_dir_number++; break; 
 	}
 	return 0;
-} */
+}
 
 int num_of_subfolders(char *path) {
 
@@ -172,6 +202,25 @@ int num_of_subfolders(char *path) {
 }
   closedir(dirp);
   return file_count;
+}
+
+int currentDirectorySubfolders() {
+    DIR *dirp;
+    struct dirent *dp;
+    struct stat filestat;
+    int dirs=0;
+    if(NULL==(dirp=opendir("."))) ERR("opendir");
+    do {
+        errno=0;
+        if((dp=readdir(dirp))!=NULL) {
+            if (lstat(dp->d_name, &filestat)) ERR("lstat");
+            if (S_ISDIR(filestat.st_mode)) dirs++;
+        }
+    } while (dp!=NULL);
+    
+    if (errno!=0) ERR("readdir");
+    if (closedir(dirp)) ERR("closedir");
+    return dirs;
 }
 
 /* void scan_dir (char *path, int total_subfolders) {
@@ -200,26 +249,136 @@ int num_of_subfolders(char *path) {
 	if (errno != 0) ERR("readdir");
 	if(closedir(dirp)) ERR("closedir");
 	printf("Dirs: %d\n",dirs);
-}
+} */
 
-struct Graph generate_graph(const char *pathd, const char *pathf) {
+void mapFromDir(char *pathd, char *pathf) {
     int number_of_rooms = 0;
 
     if(nftw(pathd,walk,MAXFD,FTW_PHYS)==0) {
-        number_of_rooms = dirs;
-        dirs = 0;
+        number_of_rooms = global_dir_number;
+        global_dir_number = 0;
+    }
+    // printf("%d", number_of_rooms);
+    graph *map = createAGraph(number_of_rooms);
+    int currentRoomNumber = 1;
+
+    recursiveCreateMap(map, pathd, 0, &currentRoomNumber);
+
+    map->items = malloc(sizeof(item) * map->numItems);
+
+  int room_arr[map->numVertices * 2];
+
+  for (int k= 0, j = 0; k < map->numVertices * 2; k++, k++, j++) { // Creating array of rooms, which will look like [0, 0, 1, 1, 2, 2 ... n, n] 
+      room_arr[k] = room_arr[k+1] = j;
+  }
+
+  for (int k=0; k < map->numVertices; k++) {
+    map->adjLists[k]->current_items[0] = map->adjLists[k]->current_items[1] = -1; // current_item = -1 means there is no items
+    map->adjLists[k]->allocated_items[0] = map->adjLists[k]->allocated_items[1] = -1; // allocated_items = -1 means there are no assigned items yet
+  }
+
+  shuffle(room_arr, map->numVertices * 2); // Shuffling the array, so now this array is random rooms with no more than 2 similar rooms 
+  
+
+  for (int j = 0, t = 100; j < map->numItems; j++, t++) {
+      map->items[j].item_number = t; // Each item must have the unique number from set [100, inf)
+      map->items[j].allocated_to_room = room_arr[j]; // Each item have its own assigned room, which is taken from random [room_arr]
+      
+      if (map->adjLists[room_arr[j]]->allocated_items[0] == -1) { // Also adding the information about assigned items to room structure
+        map->adjLists[room_arr[j]]->allocated_items[0] = map->items[j].item_number;
+      }
+      else if (map->adjLists[room_arr[j]]->allocated_items[1] == -1) {
+        map->adjLists[room_arr[j]]->allocated_items[1] = map->items[j].item_number;
+      }
+  }
+
+
+  int item_arr[map->numItems]; // Creating the array of all items on the map
+
+  for (int k=0; k<map->numItems; k++) {
+    item_arr[k] = map->items[k].item_number; // Copying values
+  }
+
+  shuffle(item_arr, map->numItems); // Shuffling the array of items
+
+  for (int j = 0, k = 0; k < map->numItems; j++) { // Assigning each room current item. Items are taken from randomly created array item_arr    
+    if (j == map->numVertices) { j = 0; } 
+    int zero_or_one = ((rand() % 2));
+    if (zero_or_one == 0) {
+        continue;
+    }
+    else {
+        if (map->adjLists[j]->current_items[0] == -1) { map->adjLists[j]->current_items[0] = item_arr[k]; k++; }
+        else if (map->adjLists[j]->current_items[1] == -1) { map->adjLists[j]->current_items[1] = item_arr[k]; k++; }
+        else continue;
+    }
+  }
+
+//    printGraph(map);
+
+
+   save_game(map, pathf);
+
+} 
+
+void recursiveCreateMap(graph *map, char *path, int roomNumber, int *currentRooms) {
+  if (*currentRooms > map->numVertices) return;
+  if (chdir(path)) { ERR("Cannot open this path");}
+  
+  int numberSub = currentDirectorySubfolders() - 2;
+  // printf("%d", numberSub);
+//  char **subdirNames;
+
+  // if (numberSub == 0) {  return; }
+
+  int curRoomsArr[numberSub];
+
+  for (int i = 0; i < numberSub; i++) {
+    if (isThereEdge(map, roomNumber, *currentRooms) == 0) {
+      addEdge(map, roomNumber, *currentRooms);
+       curRoomsArr[i] = *currentRooms;
+/*        printf("\nAdded edge between %d and %d", roomNumber, *currentRooms);
+       printf("%d", *currentRooms); */
+      *currentRooms = *currentRooms + 1;
+    }
+  }
+
+  DIR *folder;
+  struct dirent *entry;
+  struct stat filestat;
+
+  folder = opendir(".");
+  if(folder == NULL)
+    {
+      ERR("Unable to read directory");
     }
 
-    struct Graph* map = createAGraph(number_of_rooms);
-    int k = 1;
-    createNode(k);
-    k++;
+/*   if (numberSub==0) printf(" 0 ");
 
-    for (int i = 1; i < number_of_rooms; i++) {
-        for (int j = 0; )
-    }
+  for (int i = 0; i < numberSub; i++) {
+    printf(" %d ", curRoomsArr[i]);
+  } */
 
-} */
+  entry=readdir(folder);
+  entry=readdir(folder);
+
+  for(int i = 0; i < numberSub; i++) 
+  {
+      entry=readdir(folder);
+      // printf("%s", entry->d_name);
+      stat(entry->d_name,&filestat);
+      if( S_ISDIR(filestat.st_mode) ) {
+/*         printf("%s", entry->d_name);
+        printf("%d", curRoomsArr[i]);
+        printf("%d", *currentRooms); */
+        recursiveCreateMap(map, entry->d_name, curRoomsArr[i], currentRooms);
+        /* subdirNames[i] = malloc(sizeof(char) * strlen(entry->d_name));
+        strcpy(subdirNames[i], entry->d_name); */
+      }
+  }
+  chdir("..");
+  closedir(folder);
+}
 
 int main_menu() {
   char *read_map = "read-map"; char *map_from_dir_tree = "map-from-dir-tree"; char *generate_random_map = "generate-random-map"; char *load_game = "load-game"; char *exit = "exit";
@@ -260,10 +419,11 @@ int main_menu() {
         strcpy(path_d, path_d_from_command(command, map_from_dir_tree));
         strcpy(path_f, path_f_from_command(command, path_d, map_from_dir_tree));
 
-
+        mapFromDir(path_d, path_f);
+/*         printf("command length: %lu, map-from-dir-tree: %lu", strlen(command), strlen(map_from_dir_tree));
         printf("path-d: %s %lu, path-f: %s %lu\n", path_d, strlen(path_d), path_f, strlen(path_f));
         free(path_d);
-        free(path_f);
+        free(path_f); */
       }
       else if (strncmp(command, generate_random_map, strlen(generate_random_map)) == 0) {
 
@@ -294,7 +454,7 @@ int main_menu() {
         strcpy(path, single_path_from_command(command, load_game));
         start_load_game(path);
         free(path);
-        printf("%s %lu\n", path, strlen(path));
+//        printf("%s %lu\n", path, strlen(path));
       }
       else if (strncmp(command, exit, strlen(exit)) == 0) {
         return EXIT_SUCCESS;
@@ -355,17 +515,17 @@ void read_map_f(char *path) {
 
   graph *gr = load_game_func(path);
 
-  printf("Vertices: %d\nItems: %d\nCorrect Items: %d\nCurrent Room: %d\n", gr->numVertices, gr->numItems, gr->numCorrectItems, gr->currentRoom);
+/*   printf("Vertices: %d\nItems: %d\nCorrect Items: %d\nCurrent Room: %d\n", gr->numVertices, gr->numItems, gr->numCorrectItems, gr->currentRoom);
 
   printf("Player items: %d %d\n", gr->play.current_items[0], gr->play.current_items[1]);
 
   for (int i = 0; i < gr->numItems; i++) {
     printf("Item: %d allocated to room %d\n", gr->items[i].item_number, gr->items[i].allocated_to_room);
-  }
+  } */
 
-  //start_game(gr);
+  start_game(gr);
 
- // printGraph(gr); 
+//   printGraph(gr); 
   
 }
 
@@ -384,6 +544,8 @@ void start_game(graph *map) {
   map->currentRoom = (rand() % map->numVertices); // Random staring room
 
   int main_menu_ = 0;
+
+  game_end(map);
 
   while (map->numCorrectItems != map->numItems) {
 
@@ -463,26 +625,28 @@ void start_game(graph *map) {
 
       }
       else if (strncmp(command, save, strlen(save)) == 0) {
-        char path[MAX_LINE - strlen(command)];
-        for (int i = strlen(save) + 1, j = 0; i < strlen(command) - 1; i++, j++) { // Storing path as a string
-            path[j] = command[i];
-        }
+        char *path = malloc(sizeof(path));
+        path = single_path_from_command(command, save);
         
-        FILE *map_file;
-
-        map_file = fopen(path, "wb");
-
-        if (map_file == NULL) {
-          fprintf(stderr, "Error opening file\n");
-        }
-        fwrite(map, sizeof *map, 1, map_file); // Writing the created map into the file [path]
-
-        fclose(map_file);
+        save_game(map, path);
 
         printf("\n Saved the current game to the [%s]\n", path);
       }
       else if (strncmp(command, find_path, strlen(find_path)) == 0) {
-        printf("find_path");
+        char *threadsChar = path_d_from_command(command, find_path);
+        char *toRoomChar = path_f_from_command(command, threadsChar, find_path);
+
+        int threadsAmount = atoi(threadsChar);
+        int toRoom = atoi(toRoomChar);
+
+        struct path min_path = k_thread_method(map, threadsAmount, map->currentRoom, toRoom);
+        
+        printf("Best path from %d to %d\nLength: %d\nPath:", map->currentRoom, toRoom, min_path.path_length);
+
+        for (int i = 0; i < min_path.path_length; i++) {
+            printf("%d ", min_path.path_rooms[i]);
+        }
+        printf("\n");
       }
       else if (strncmp(command, quit, strlen(quit)) == 0) {
         main_menu_ = 1;
@@ -492,7 +656,6 @@ void start_game(graph *map) {
       printf("\nWrong command\n");
     }
     game_end(map);
-    printf("\nTotal number of items: %d \nTotal number of items in correct spots: %d\n", map->numItems, map->numCorrectItems);
   }
 
   if (map->numItems == map->numCorrectItems) printf("\n----------GAME OVER----------\n");
@@ -624,6 +787,8 @@ void start_load_game(char *path) {
         printf("\n Saved the current game to the [%s]\n", path);
       }
       else if (strncmp(command, find_path, strlen(find_path)) == 0) {
+
+
         printf("find_path");
       }
       else if (strncmp(command, quit, strlen(quit)) == 0) {
@@ -729,6 +894,8 @@ void rand_map(int n, char *path) {
     }
   }
 
+//  printGraph(map);
+
   save_game(map, path);
   
 
@@ -738,23 +905,22 @@ void rand_map(int n, char *path) {
 }
 
 
-
 int main(int argc, char** argv) {
-    if (argc > 2) usage();
+    //if (argc > 2) usage();
 
     main_menu();
 
-/* 
-
-    struct Graph* graph = createAGraph(4);
+/*     struct Graph* graph = createAGraph(5);
     addEdge(graph, 0, 1);
     addEdge(graph, 0, 2);
     addEdge(graph, 0, 3);
+    addEdge(graph, 0, 4);
     addEdge(graph, 1, 2);
 
-    printGraph(graph);
- */
-    /*if(nftw(argv[1],walk,MAXFD,FTW_PHYS)==0)
+    printGraph(graph); */
+
+ /*
+    if(nftw(argv[1],walk,MAXFD,FTW_PHYS)==0)
 			printf("Number of subfolders: %d\n", dirs);
 
     printf("Number of subfolders: %d\n", num_of_subfolders(argv[1])); */
@@ -793,18 +959,20 @@ void game_instructions() {
 }
 
 void current_game_output(graph *map) {
+  printf("\nTotal number of items: %d \nTotal number of items in correct spots: %d\n", map->numItems, map->numCorrectItems);
+
   printf("You are currently in the room: %d\n", map->currentRoom);
-      printf("You can travel to the rooms:");
-      room *temp = map->adjLists[map->currentRoom];
-      while (temp) {
-        printf("%d ", temp->vertex);
-        temp = temp->next;
-      }
-      printf("\n");
-      printf("Your current items:");
-      for (int k = 0; k < MAX_ITEMS; k++) {
-        if (map->play.current_items[k] != -1) printf("%d ", map->play.current_items[k]);
-      }
+  printf("You can travel to the rooms:");
+  room *temp = map->adjLists[map->currentRoom];
+  while (temp) {
+    printf("%d ", temp->vertex);
+    temp = temp->next;
+  }
+  printf("\n");
+  printf("Your current items:");
+  for (int k = 0; k < MAX_ITEMS; k++) {
+    if (map->play.current_items[k] != -1) printf("%d ", map->play.current_items[k]);
+  }
       printf("\n");
 
       printf("Items in this room:");
@@ -837,9 +1005,9 @@ char* path_d_from_command(char *line, char *command) {
   int j = 0;
   for (int i = strlen(command) + 1; i < strlen(line); i++, j++) {
     if (line[i] == ' ') break;
-      path_d[j] = line[i];
+    path_d[j] = line[i];
     }
-    path_d[j] = '\0';
+  path_d[j] = '\0';
   return path_d;
 }
 
@@ -849,7 +1017,7 @@ char *path_f_from_command(char *line, char *path_d, char *command) {
   for (int i = strlen(command) + strlen(path_d) + 2; i < strlen(line) - 1; i++, j++) {
     path_f[j] = line[i];
   }
-  path_d[j] = '\0';
+  path_f[j] = '\0';
   return path_f;
 }
 
@@ -861,7 +1029,7 @@ int int_from_command(char *line, char *command) {
   return num;
 }
 
-// ------------------------ Game functions --------------------------
+// ------------------------ Saving and loading game (marshalling) --------------------------
 
 
 void save_game(graph *map, char *path) {
@@ -872,14 +1040,6 @@ void save_game(graph *map, char *path) {
   if (map_file == NULL) {
      fprintf(stderr, "Error opening file\n");
   }
-
-/*  int numVertices;
-  int numItems;
-  int numCorrectItems;
-  int currentRoom;
-  player play;
-  item *items;
-  struct node** adjLists; */
 
   fwrite(&map->numVertices, sizeof(int), 1, map_file);
   fwrite(&map->numItems, sizeof(int), 1, map_file);
@@ -892,13 +1052,23 @@ void save_game(graph *map, char *path) {
   }
 
   for (int i = 0; i < map->numVertices; i++) {
+    size_t length = numberAdjVertices(map, i);
+    fwrite(&length, sizeof(length), 1, map_file);
+
     room *temp = map->adjLists[i];
-    while (temp) {
+
+    for(int j = 0; j < length; j++) {
       fwrite(&temp->vertex, sizeof(temp->vertex), 1, map_file);
-      fwrite(&temp->allocated_items, sizeof(temp->allocated_items), 1, map_file);
+      temp = temp->next;
+    } 
+  }
+
+  for (int i = 0; i < map->numVertices; i++) {
+    room *temp = map->adjLists[i];
+    while(temp) {
       fwrite(&temp->current_items, sizeof(temp->current_items), 1, map_file);
       temp = temp->next;
-    }    
+    }
   }
 
   fclose(map_file);
@@ -907,23 +1077,18 @@ void save_game(graph *map, char *path) {
 graph *load_game_func(char *path) {
   FILE *map_file;
 
-  graph *map = malloc(sizeof(graph));
-
   map_file = fopen(path, "rb");
 
   if (map_file == NULL) {
     fprintf(stderr, "Error opening file\n");
   }
 
-/*  int numVertices;
-  int numItems;
-  int numCorrectItems;
-  int currentRoom;
-  player play;
-  item *items;
-  struct node** adjLists; */
+  int map_size = 0;
 
-  fread(&map->numVertices, sizeof(int), 1, map_file);
+  fread(&map_size, sizeof(int), 1, map_file);
+
+  graph *map = createAGraph(map_size);
+
   fread(&map->numItems, sizeof(int), 1, map_file);
   fread(&map->numCorrectItems, sizeof(int), 1, map_file);
   fread(&map->currentRoom, sizeof(int), 1, map_file);
@@ -934,22 +1099,95 @@ graph *load_game_func(char *path) {
   for (int i = 0; i < map->numItems; i++) {
     fread(&map->items[i], sizeof(map->items[i]), 1, map_file); 
   }
-  
+
   for (int i = 0; i < map->numVertices; i++) {
-    map->adjLists[i] = malloc(sizeof(room));
+    size_t length;
+    fread(&length, sizeof(length), 1, map_file);
+    for (int j = 0; j < length; j++) {
+      int ver;
+      fread(&ver, sizeof(map->adjLists[j]->vertex), 1, map_file);
+      if (isThereEdge(map, i, ver) == 0) addEdge(map, i, ver);
+    }    
   }
 
   for (int i = 0; i < map->numVertices; i++) {
     room *temp = map->adjLists[i];
-    while (temp) {
-      fread(&temp->vertex, sizeof(temp->vertex), 1, map_file);
-      fread(&temp->allocated_items, sizeof(temp->allocated_items), 1, map_file);
-      fread(&temp->current_items, sizeof(temp->current_items), 1, map_file);    
+    while(temp) {
+      fread(&temp->current_items, sizeof(temp->current_items), 1, map_file);
       temp = temp->next;
-    }    
-  } 
+    }
+  }
+
+  for (int k=0; k < map->numVertices; k++) {
+    map->adjLists[k]->allocated_items[0] = map->adjLists[k]->allocated_items[1] = -1; // allocated_items = -1 means there are no assigned items yet
+  }
+
+  for (int i = 0; i < map->numItems; i++) { // Assigning items to rooms
+    item temp = map->items[i];
+    if (map->adjLists[temp.allocated_to_room]->allocated_items[0] == -1) map->adjLists[temp.allocated_to_room]->allocated_items[0] = temp.item_number;
+    else if (map->adjLists[temp.allocated_to_room]->allocated_items[1] == -1) map->adjLists[temp.allocated_to_room]->allocated_items[1] = temp.item_number;
+  }
 
   fclose(map_file);
 
   return map;
+}
+
+// --------------------------------- Game functions ---------------------------------
+
+path k_thread_method(graph *gr, int threadAmount, int from_room, int to_room) {
+  path *paths = malloc(sizeof(path) * threadAmount);
+  path min_path;
+
+  unsigned int minimum_path_length = gr->numVertices;
+  unsigned int possible_path_length;
+
+  if (paths == NULL) ERR("Error malloc for paths!\n");
+  srand(time(NULL));
+
+  for (int i = 0; i < threadAmount; i++) {
+    paths[i].seed = rand();
+    paths[i].map = gr;
+    paths[i].from_room = from_room;
+    paths[i].to_room = to_room;
+  }
+
+  for (int i = 0; i < threadAmount; i++) {
+    int err = pthread_create(&(paths[i].tid), NULL, find_path, &paths[i]);
+    if (err != 0) ERR("Couldn't create thread");
+  }
+
+  for (int i = 0; i < threadAmount; i++) {
+    int err = pthread_join(paths[i].tid, (void*)&possible_path_length);
+    if (err != 0) ERR("Couldn't create thread");
+
+    if (possible_path_length < minimum_path_length) {
+      minimum_path_length = possible_path_length;
+      min_path.path_length = minimum_path_length;
+      min_path.path_rooms = paths[i].path_rooms;
+    }
+  }
+  free(paths);
+  return min_path;
+}
+
+void *find_path(void *voidPtr) {
+  path *current_path = voidPtr;
+  int *pos_leng = 0;
+  int cur_room = current_path->from_room;
+
+  for (int i = 0; i < 1000; i++) {
+    if (cur_room == current_path->to_room) return pos_leng;
+    int *adj_rooms = malloc(sizeof(numberAdjVertices(current_path->map, cur_room)));
+    room *temp = current_path->map->adjLists[cur_room];
+    for (int j = 0; j < numberAdjVertices(current_path->map, cur_room); j++) {
+      adj_rooms[j] = temp[j].vertex;
+      temp = temp->next;
+    }
+    shuffle(adj_rooms, numberAdjVertices(current_path->map, cur_room));
+    cur_room = adj_rooms[0];
+    pos_leng++;
+  }
+
+  return pos_leng;
 }
