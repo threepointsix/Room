@@ -14,10 +14,12 @@
 #include <unistd.h>
 #include <ftw.h>
 #include <limits.h>
+#include <stdbool.h>
 
-#define MAXFD 20
+#define MAXFD 100
 #define MAX_LINE 100
 #define MAX_ITEMS 2
+#define MAX_PATH 256
 #define MAX_PATH_LENGTH 1000
 #define ERR(source) (perror(source),\
                      fprintf(stderr,"%s:%d\n",__FILE__,__LINE__),\
@@ -34,6 +36,7 @@ typedef struct item {
 
 typedef struct player { // Player can only carry 2 items
   int current_items[MAX_ITEMS]; // Current items, that player is carrying
+  int currentRoom;
 } player;
 
 
@@ -49,10 +52,12 @@ typedef struct Graph { // Graph is a map, where the game is played.
   int numVertices; // Total number of rooms (vertices)
   int numItems; // Total number of items on the map
   int numCorrectItems; // Total number of items in the correct place. Game ends, when [numItems == numCorrectItems]
-  int currentRoom; // ID of current room (although it would be more logical to store current room ID inside struct player)
   player play; // It is single player game, so only 1 player on the map :)
   item *items; // Array of all items on the map (needed to save the map into the file)
   struct node** adjLists; // Simple adjacency list of the graph
+  char *backupPath;
+
+  pthread_t threads[2]; // Game thread and autosave thread (here also should be not implemented thread, that waits for SIGUSR1 signal)
 } graph;
 
 typedef struct path {
@@ -68,6 +73,8 @@ typedef struct path {
 
 // ------ Declaring all functions
 
+void usage();
+
 // -- Graph (map) functions
 
 struct node* createNode(int); // Adding a node (room) to the graph (map)
@@ -79,12 +86,12 @@ int numberAdjVertices(graph *gr, int n); // Number of doors in the room
 
 // -- Main menu functions
 
-int mainMenu();  // All functions are collected there
+int mainMenu(char *backupPath);  // All functions are collected there
 void mainMenuInstructions(); // Printing a list of commands available in the main menu
-void readMap(char *path); // Reading a map from path, and starting a new game (i.e. random items in random spots && player initally carries no items)
+void readMap(char *path, char *backupPath); // Reading a map from path, and starting a new game (i.e. random items in random spots && player initally carries no items)
 void randMap(int n, char *path); // Creating random map with [n] rooms
-void startNewGame(graph *map); // Starts a new game
-void startLoadGame(char *path); // Loading the game (i.e. items positions are taken from the file && player current items && items assignment to rooms)
+void startNewGame(graph *map, char *backupPath); // Starts a new game
+void startLoadGame(char *path, char *backupPath); // Loading the game (i.e. items positions are taken from the file && player current items && items assignment to rooms)
 void mapFromDir(char *pathd, char *pathf); // Creating a map, which copies directory structure of [pathd] file, and saves the created map into [pathf] file
 
 void recursiveCreateMap(graph *map, char *path, int roomNumber, int *currentRooms); // Used in [mapFromDir]
@@ -94,7 +101,7 @@ int walk(const char *name, const struct stat *s, int type, struct FTW *f); // Re
 
 // -- In-game functions
 
-void inGame(graph *map); // All functions are collected there
+void *inGame(void *arg); // All functions are collected there
 void gameInstructions(); // Printing a list of commands available in-game
 void currentGameOutput(graph *gr); // Printing current game state 
 void moveTo(graph *map, int to); // Move to room 
@@ -104,6 +111,9 @@ void gameEnd(graph *gr); // It checks if total number of items on the map is equ
 
 void kThreadMethod(graph *gr, int threadAmount, int from_room, int to_room); // Seeks for shortest path using k threads
 void *findPath(void *voidPtr); // Worker function
+
+void *autosave(void *arg); // Partly working (autosaving each 60 seconds, doesn't restart on manual save)
+void *waitingForSIGUSR(void *arg); // Not implemented
 
 // -- Reading commands functions
 
@@ -120,13 +130,47 @@ graph *loadGame(char *path); // Load game by reading all data in the right order
 
 int main(int argc, char** argv) {    
 
+    if (argc > 3) {
+      usage();
+      return EXIT_FAILURE;
+    }
+
+    char *backupEnv = getenv("GAME_AUTOSAVE");
     srand(time(NULL));
-    mainMenu();
+    
+    if (argc > 1) {
+      int c;
+      while ((c = getopt(argc, argv, "b:")) != -1) {
+        switch (c) {
+          case 'b':
+            printf("\nEvery 60 seconds your game backup will be saved to: [%s]\n", optarg);
+            mainMenu(optarg);
+            break;
+          default:
+            usage();
+            return EXIT_FAILURE;
+        }
+      }
+    }
+    else if (backupEnv != NULL) {
+      printf("\nEvery 60 seconds your game backup will be saved to: [%s]\n", backupEnv);
+      mainMenu(backupEnv);
+    }
+    else {
+      char *homePath = (char*)malloc(strlen(getenv("HOME")) + strlen("/game-autosave") + 2);
+      homePath = strcat(getenv("HOME"), "/game-autosave");
+      printf("\nEvery 60 seconds your game backup will be saved to: [%s]\n", homePath);
+      mainMenu(homePath);
+    }
 
     return EXIT_SUCCESS;
 }
 
 // -------------------------- Output functions (not interesting) ------------------------
+
+void usage() {
+  printf("\nUsage: ./main -b [path]\n");
+}
 
 void mainMenuInstructions() {
   printf("\n---------------Main menu---------------\n\n");
@@ -157,9 +201,9 @@ void gameInstructions() {
 void currentGameOutput(graph *map) {
   printf("\nTotal number of items: %d \nTotal number of items in correct spots: %d\n", map->numItems, map->numCorrectItems);
 
-  printf("You are currently in the room: %d\n", map->currentRoom);
+  printf("You are currently in the room: %d\n", map->play.currentRoom);
   printf("You can travel to the rooms:");
-  room *temp = map->adjLists[map->currentRoom];
+  room *temp = map->adjLists[map->play.currentRoom];
   while (temp) {
     printf("%d ", temp->vertex);
     temp = temp->next;
@@ -173,13 +217,13 @@ void currentGameOutput(graph *map) {
 
       printf("Items in this room:");
       for (int k = 0; k < MAX_ITEMS; k++) {
-        if (map->adjLists[map->currentRoom]->current_items[k] != -1) printf("%d ", map->adjLists[map->currentRoom]->current_items[k]);
+        if (map->adjLists[map->play.currentRoom]->current_items[k] != -1) printf("%d ", map->adjLists[map->play.currentRoom]->current_items[k]);
       }
       printf("\n");
 
       printf("Items assigned to this room:");
       for (int k = 0; k < MAX_ITEMS; k++) {
-        if (map->adjLists[map->currentRoom]->allocated_items[k] != -1) printf("%d ", map->adjLists[map->currentRoom]->allocated_items[k]);
+        if (map->adjLists[map->play.currentRoom]->allocated_items[k] != -1) printf("%d ", map->adjLists[map->play.currentRoom]->allocated_items[k]);
       }
       printf("\n");
 }
@@ -187,7 +231,7 @@ void currentGameOutput(graph *map) {
 // ------------------------ Functions for taking paths and integers from given commands -----------------------
 
 char* singlePathFromLine(char *line, char *command) {
-  char *path = malloc(sizeof(path));
+  char *path = malloc(sizeof(char)*(strlen(line) - strlen(command)));
   int j = 0;
   for (int i = strlen(command) + 1; i < strlen(line) - 1; i++, j++) { // Storing path as a string
     path[j] = line[i];
@@ -197,7 +241,7 @@ char* singlePathFromLine(char *line, char *command) {
 }
 
 char* pathDFromLine(char *line, char *command) {
-  char *path_d  = malloc(sizeof(path_d));
+  char *path_d  = malloc(sizeof(char)*(strlen(line) - strlen(command)));
   int j = 0;
   for (int i = strlen(command) + 1; i < strlen(line); i++, j++) {
     if (line[i] == ' ') break;
@@ -208,7 +252,7 @@ char* pathDFromLine(char *line, char *command) {
 }
 
 char *pathFFromLine(char *line, char *path_d, char *command) {
-  char *path_f = malloc(sizeof(path_f));
+  char *path_f = malloc(sizeof(char)*(strlen(line) - strlen(command) - strlen(path_d)));
   int j = 0;
   for (int i = strlen(command) + strlen(path_d) + 2; i < strlen(line) - 1; i++, j++) {
     path_f[j] = line[i];
@@ -218,7 +262,7 @@ char *pathFFromLine(char *line, char *path_d, char *command) {
 }
 
 int singleIntFromLine(char *line, char *command) {
-  char *num_string = malloc(sizeof(num_string));
+  char *num_string = malloc(sizeof(char)*strlen(line)-strlen(command));
   int num;
   strcpy(num_string, pathDFromLine(line, command));
   num = atoi(num_string);
@@ -230,18 +274,17 @@ int singleIntFromLine(char *line, char *command) {
 
 void saveGame(graph *map, char *path) {
   FILE *map_file;
-
   map_file = fopen(path, "wb"); // Creating the file [path]
 
   if (map_file == NULL) {
-     fprintf(stderr, "Error opening file123\n");
+     fprintf(stderr, "Error opening file\n");
      return;
   }
 
   fwrite(&map->numVertices, sizeof(int), 1, map_file); // 1. Total number of rooms
   fwrite(&map->numItems, sizeof(int), 1, map_file); // 2. Total number of items
   fwrite(&map->numCorrectItems, sizeof(int), 1, map_file); // 3. Total number of items in correct place
-  fwrite(&map->currentRoom, sizeof(int), 1, map_file); // 4. Current room ID
+  fwrite(&map->play.currentRoom, sizeof(int), 1, map_file); // 4. Current room ID
   fwrite(&map->play, sizeof(player), 1, map_file); // 5. Player's current items
 
   for (int i = 0; i < map->numItems; i++) {
@@ -268,12 +311,13 @@ void saveGame(graph *map, char *path) {
     }
   }
 
+
+  printf("\nSaved the current game to the [%s]\n", path);
   fclose(map_file);
 }
 
 graph *loadGame(char *path) { // Loading is performed in the same order, as data was written in [saveGame] function
   FILE *map_file;
-
   map_file = fopen(path, "rb");
 
   if (map_file == NULL) {
@@ -288,7 +332,7 @@ graph *loadGame(char *path) { // Loading is performed in the same order, as data
 
   fread(&map->numItems, sizeof(int), 1, map_file);
   fread(&map->numCorrectItems, sizeof(int), 1, map_file);
-  fread(&map->currentRoom, sizeof(int), 1, map_file);
+  fread(&map->play.currentRoom, sizeof(int), 1, map_file);
   fread(&map->play, sizeof(player), 1, map_file);
 
   map->items = malloc(sizeof(item) * map->numItems);
@@ -385,8 +429,8 @@ void kThreadMethod(graph *gr, int threadAmount, int from_room, int to_room) {
   }
   free(paths);
 
-  if (min_path->path_length > gr->numVertices) { // Obviously, in the connected graph, shortest path is at most [number of vertices - 1]
-    printf("\nPath from %d to %d:\n\n", gr->currentRoom, to_room);
+  if (min_path->path_length > gr->numVertices) { // Obviously, in the connected graph, shortest path between any two points is at most [number of vertices - 1]
+    printf("\nPath from %d to %d:\n\n", gr->play.currentRoom, to_room);
     for (int i = 0; i < min_path->path_length; i++) {
     printf("%d ", min_path->path_rooms[i]);
     }
@@ -394,7 +438,7 @@ void kThreadMethod(graph *gr, int threadAmount, int from_room, int to_room) {
     }
 
   else {
-    printf("\nPath from %d to %d using %d-threads:\n\n", gr->currentRoom, to_room, threadAmount);
+    printf("\nPath from %d to %d using %d-threads:\n\n", gr->play.currentRoom, to_room, threadAmount);
 
   for (int i = 0; i < min_path->path_length; i++) {
     printf("%d ", min_path->path_rooms[i]);
@@ -438,10 +482,15 @@ void *findPath(void *voidPtr) {
   return pos_leng;
 }
 
-void autosave(graph *map, char *path) {
-  struct timespec sec = {60, 0};
-  nanosleep(&sec, NULL);
-  saveGame(map, path);
+void *autosave(void *arg) {
+  graph *map = arg;
+  while (1) {
+    struct timespec sec = {30, 0};
+    nanosleep(&sec, NULL);
+    saveGame(map, map->backupPath);
+  }
+
+    return NULL;
 }
 
 void gameEnd(graph *gr) {
@@ -457,8 +506,10 @@ void gameEnd(graph *gr) {
   }
 }
 
-void inGame(graph *map) {
+void *inGame(void *arg) {
   char *move_to = "move-to"; char *pick_up = "pick-up"; char *drop = "drop"; char *save = "save"; char *findPath = "find-path"; char *quit = "quit";
+
+  graph *map = arg;
 
   char command[MAX_LINE+2];
   int main_menu_ = 0;
@@ -485,9 +536,9 @@ void inGame(graph *map) {
       }
       else if (strncmp(command, save, strlen(save)) == 0) {
         char *path = malloc(sizeof(path));
-        path = singlePathFromLine(command, save); 
+        path = singlePathFromLine(command, save);
+        printf("\n%s\n", path);
         saveGame(map, path);
-        printf("\nSaved the current game to the [%s]\n", path);
       }
       else if (strncmp(command, findPath, strlen(findPath)) == 0) {
         char *threadsChar = pathDFromLine(command, findPath);
@@ -496,7 +547,7 @@ void inGame(graph *map) {
         int threadsAmount = atoi(threadsChar);
         int toRoom = atoi(toRoomChar);
 
-        kThreadMethod(map, threadsAmount, map->currentRoom, toRoom);
+        kThreadMethod(map, threadsAmount, map->play.currentRoom, toRoom);
       }
       else if (strncmp(command, quit, strlen(quit)) == 0) {
         main_menu_ = 1;
@@ -508,28 +559,30 @@ void inGame(graph *map) {
     gameEnd(map);
   }
 
-  if (map->numItems == map->numCorrectItems) printf("\n----------GAME OVER----------\n");
-  if (main_menu_ == 1) { mainMenuInstructions(); return; }
+  pthread_cancel(map->threads[1]);
+  if (map->numItems == map->numCorrectItems) { printf("\n----------GAME OVER----------\n"); mainMenuInstructions(); return(void*)1; }
+  if (main_menu_ == 1) { mainMenuInstructions(); return (void*)2; }
+  return (void*)0;
 }
 
 void moveTo(graph *map, int to) {
-  if (isThereEdge(map, map->currentRoom, to) == 1) {
-          map->currentRoom = to;
+  if (isThereEdge(map, map->play.currentRoom, to) == 1) {
+          map->play.currentRoom = to;
         }
   else {
-          printf("You can't move from %d to %d\n", map->currentRoom, to);
+          printf("You can't move from %d to %d\n", map->play.currentRoom, to);
         }
 }
 
 void pickUp(graph *map, int item_number) {
-  if (map->adjLists[map->currentRoom]->current_items[0] == item_number) {
-          if (map->play.current_items[0] == -1) { map->play.current_items[0] = item_number; map->adjLists[map->currentRoom]->current_items[0] = -1;}
-          else if (map->play.current_items[1] == -1) { map->play.current_items[1] = item_number; map->adjLists[map->currentRoom]->current_items[0] = -1;} 
+  if (map->adjLists[map->play.currentRoom]->current_items[0] == item_number) {
+          if (map->play.current_items[0] == -1) { map->play.current_items[0] = item_number; map->adjLists[map->play.currentRoom]->current_items[0] = -1;}
+          else if (map->play.current_items[1] == -1) { map->play.current_items[1] = item_number; map->adjLists[map->play.currentRoom]->current_items[0] = -1;} 
           else printf("You cannot carry more items :(\n");
         }
-  else if (map->adjLists[map->currentRoom]->current_items[1] == item_number) {
-          if (map->play.current_items[0] == -1) { map->play.current_items[0] = item_number; map->adjLists[map->currentRoom]->current_items[1] = -1; }
-          else if (map->play.current_items[1] == -1) { map->play.current_items[1] = item_number; map->adjLists[map->currentRoom]->current_items[1] = -1; }
+  else if (map->adjLists[map->play.currentRoom]->current_items[1] == item_number) {
+          if (map->play.current_items[0] == -1) { map->play.current_items[0] = item_number; map->adjLists[map->play.currentRoom]->current_items[1] = -1; }
+          else if (map->play.current_items[1] == -1) { map->play.current_items[1] = item_number; map->adjLists[map->play.currentRoom]->current_items[1] = -1; }
           else printf("You cannot carry more items :(\n");
         }
   else {
@@ -538,26 +591,26 @@ void pickUp(graph *map, int item_number) {
 }
 
 void dropItem(graph *map, int item_number) {
-  if ((map->adjLists[map->currentRoom]->current_items[0] != -1) && (map->adjLists[map->currentRoom]->current_items[1] != -1)) printf("\nThere is already maximum number of items in the room :(\n");
+  if ((map->adjLists[map->play.currentRoom]->current_items[0] != -1) && (map->adjLists[map->play.currentRoom]->current_items[1] != -1)) printf("\nThere is already maximum number of items in the room :(\n");
 
   else if (map->play.current_items[0] == item_number) {
-          if (map->adjLists[map->currentRoom]->current_items[0] == -1) {
-            map->adjLists[map->currentRoom]->current_items[0] = item_number;
+          if (map->adjLists[map->play.currentRoom]->current_items[0] == -1) {
+            map->adjLists[map->play.currentRoom]->current_items[0] = item_number;
             map->play.current_items[0] = -1;
           }
-          else if (map->adjLists[map->currentRoom]->current_items[1] == -1) {
-            map->adjLists[map->currentRoom]->current_items[1] = item_number;
+          else if (map->adjLists[map->play.currentRoom]->current_items[1] == -1) {
+            map->adjLists[map->play.currentRoom]->current_items[1] = item_number;
             map->play.current_items[0] = -1;
           }
         }
 
   else if (map->play.current_items[1] == item_number) {
-          if (map->adjLists[map->currentRoom]->current_items[0] == -1) {
-            map->adjLists[map->currentRoom]->current_items[0] = item_number;
+          if (map->adjLists[map->play.currentRoom]->current_items[0] == -1) {
+            map->adjLists[map->play.currentRoom]->current_items[0] = item_number;
             map->play.current_items[1] = -1;
           }
-          else if (map->adjLists[map->currentRoom]->current_items[1] == -1) {
-            map->adjLists[map->currentRoom]->current_items[1] = item_number;
+          else if (map->adjLists[map->play.currentRoom]->current_items[1] == -1) {
+            map->adjLists[map->play.currentRoom]->current_items[1] = item_number;
             map->play.current_items[1] = -1;
           }
         }
@@ -652,7 +705,7 @@ void printGraph(struct Graph* graph) {
 
 // -------------------------- Main menu functions ---------------------------------
 
-int mainMenu() {
+int mainMenu(char *backupPath) {
   char *read_map = "read-map"; char *map_from_dir_tree = "map-from-dir-tree"; char *generate_random_map = "generate-random-map"; char *load_game = "load-game"; char *exit = "exit";
 
   mainMenuInstructions();
@@ -665,15 +718,13 @@ int mainMenu() {
         char *path = malloc(sizeof(path));
         strcpy(path, singlePathFromLine(command, read_map));
 
-        readMap(path);
+        readMap(path, backupPath);
         free(path);
       }
       else if (strncmp(command, map_from_dir_tree, strlen(map_from_dir_tree)) == 0) {
 
-        char *path_d = malloc(sizeof(path_d));
-        char *path_f = malloc(sizeof(path_f));
-        strcpy(path_d, pathDFromLine(command, map_from_dir_tree));
-        strcpy(path_f, pathFFromLine(command, path_d, map_from_dir_tree));
+        char *path_d = pathDFromLine(command, map_from_dir_tree);
+        char *path_f = pathFFromLine(command, path_d, map_from_dir_tree);
 
         mapFromDir(path_d, path_f);
 
@@ -682,27 +733,25 @@ int mainMenu() {
       }
       else if (strncmp(command, generate_random_map, strlen(generate_random_map)) == 0) {
 
-        char *n_of_rooms_string = malloc(sizeof(n_of_rooms_string));
-        strcpy(n_of_rooms_string, pathDFromLine(command, generate_random_map));
-        int n_of_rooms = singleIntFromLine(command, generate_random_map);
-        char *path_f = malloc(sizeof(path_f));
-        strcpy(path_f, pathFFromLine(command, n_of_rooms_string, generate_random_map));
+        char *n_of_rooms_string = pathDFromLine(command, generate_random_map);
+        int n_of_rooms = atoi(n_of_rooms_string);
+        char *path_f = pathFFromLine(command, n_of_rooms_string, generate_random_map);
 
-        if (n_of_rooms < 2) printf("\nThere must be more than 2 rooms\n");
+        if (n_of_rooms <= 2) printf("\nThere must be more than 2 rooms\n");
 
         else {
+          printf("\nCreated a map with %d rooms", n_of_rooms);
           randMap(n_of_rooms, path_f);
-          printf("Created a map with %d rooms, and saved into %s", n_of_rooms, path_f);
         }
 
         free(n_of_rooms_string);
         free(path_f);
       }
       else if (strncmp(command, load_game, strlen(load_game)) == 0) {
-        char *path = malloc(sizeof(path));
-        strcpy(path, singlePathFromLine(command, load_game));
-        startLoadGame(path);
-        free(path);
+        char *path = singlePathFromLine(command, load_game);
+        printf("\n%s123 \n%s123", backupPath, backupPath);
+        startLoadGame(path, backupPath);
+        // free(path);
       }
       else if (strncmp(command, exit, strlen(exit)) == 0) {
         return EXIT_SUCCESS;
@@ -715,28 +764,33 @@ int mainMenu() {
   return EXIT_FAILURE;
 }
 
-void readMap(char *path) {
+void readMap(char *path, char *backupPath) {
 
   graph *gr = loadGame(path);
 
-  startNewGame(gr);
+  startNewGame(gr, backupPath);
   
 }
 
 void randMap(int n, char *path) {
   
+  srand(time(NULL)*getpid());
+
  graph *map = createAGraph(n);
- int i;
- for (i = 0; i < n - 1; i++) {
-   addEdge(map, i, i+1);
+ int arr[n];
+ for (int j = 0; j < n; j++) { // Creating array consisting of [0, 1, 2, ... ,n - 1]
+   arr[j] = j;
  }
 
-  addEdge(map, 0, i); // Creating a circuit in the graph, so it will be 100% connected
+  shuffle(arr, n);
 
+  for (int j = 0; j < n - 1; j++) {
+    addEdge(map, arr[j], arr[j+1]); // Adding edge between edges, such that all neighbors are connected. The graph will be in fact a path, so it will be 100% connected
+  }
   int r1;
   int r2;
 
-  for(i = 0; i < ((rand() % n) + 1); i++) { // Creating random edges between random vertices
+  for(int j = 0; j < ((rand() % n) - 1); j++) { // Creating random edges between random vertices
       r1 = ((rand() % n)); // randoming r1 [0, n) to create an edge r1-r2 
       r2 = ((rand() % n)); // randoming r2 [0, n) to create an edge r1-r2
       while (r2==r1 || isThereEdge(map, r1, r2) == 1) r2 = ((rand() % n)); // if r2==r1 or there is already an edge r2-r1 => r2 will random again
@@ -756,7 +810,7 @@ void randMap(int n, char *path) {
     map->adjLists[k]->allocated_items[0] = map->adjLists[k]->allocated_items[1] = -1; // allocated_items = -1 means there are no assigned items yet
   }
 
-  shuffle(room_arr, map->numVertices * 2); // Shuffling the array, so now this array is random rooms with no more than 2 similar rooms 
+  shuffle(room_arr, map->numVertices * 2); // Shuffling the array, so now this array contains random rooms with no more than 2 similar rooms 
   
   for (int j = 0, t = 100; j < map->numItems; j++, t++) {
       map->items[j].item_number = t; // Each item must have the unique number from set [100, inf)
@@ -779,16 +833,17 @@ void randMap(int n, char *path) {
 
   shuffle(item_arr, map->numItems); // Shuffling the array of items
 
-  for (int j = 0, k = 0; k < map->numItems; j++) { // Assigning each room current item. Items are taken from randomly created array item_arr    
+  for (int j = 0, k = 0; k < map->numItems; j++) { // Assigning each room current item. Items are taken from randomly created array item_arr 
     if (j == map->numVertices) { j = 0; } 
     int zero_or_one = ((rand() % 2));
     if (zero_or_one == 0) {
         continue;
     }
     else {
-        if (map->adjLists[j]->current_items[0] == -1) { map->adjLists[j]->current_items[0] = item_arr[k]; k++; }
-        else if (map->adjLists[j]->current_items[1] == -1) { map->adjLists[j]->current_items[1] = item_arr[k]; k++; }
-        else continue;
+      if (map->adjLists[j]->allocated_items[0] == item_arr[k] || map->adjLists[j]->allocated_items[1] == item_arr[k]) {continue;} // Checking, that items won't spawn initially in the correct room 
+      if (map->adjLists[j]->current_items[0] == -1) { map->adjLists[j]->current_items[0] = item_arr[k]; k++; }
+      else if (map->adjLists[j]->current_items[1] == -1) { map->adjLists[j]->current_items[1] = item_arr[k]; k++; }
+      else continue;
     }
   }
 
@@ -796,12 +851,23 @@ void randMap(int n, char *path) {
  
 }
 
-void startNewGame(graph *map) {
+void startNewGame(graph *map, char *backupPath) {
   gameInstructions();
   map->play.current_items[0] = map->play.current_items[1] = -1; // Player starts with no items
-    map->currentRoom = (rand() % map->numVertices); // Random staring room
-  gameEnd(map); // Initialazing current correct items (it may happen, that some items are initially spawned in correct spots)
-  inGame(map); // Go to the game
+  map->play.currentRoom = (rand() % map->numVertices); // Random staring room
+  gameEnd(map); // Initialazing current correct items (must be 0 initially)
+  
+  map->backupPath = malloc(sizeof(char) * strlen(backupPath) + 1);
+  strcpy(map->backupPath, backupPath);
+
+  if (pthread_create(&map->threads[0], NULL, inGame, map)) ERR("\nFailed to create a thread\n");
+  if (pthread_create(&map->threads[1], NULL, autosave, map)) ERR("\nFailed to create a thread\n");
+
+  if (pthread_join(map->threads[0], NULL)) ERR("\nFailed to join a thread!\n");
+  if (pthread_join(map->threads[1], NULL)) ERR("\nFailed to join a thread!\n");
+
+
+  //inGame(map); // Go to the game
 }
 
 void mapFromDir(char *pathd, char *pathf) {
@@ -870,15 +936,24 @@ void mapFromDir(char *pathd, char *pathf) {
         else continue;
     }
   }
-
+  
+  printf("Created a map with [%d] rooms", map->numVertices);
    saveGame(map, pathf);
+
 
 } 
 
-void startLoadGame(char *path) {
+void startLoadGame(char *path, char *backupPath) {
   gameInstructions();
   graph *map = loadGame(path);
-  inGame(map);
+  map->backupPath = malloc(sizeof(char) * strlen(backupPath) + 1);
+  strcpy(map->backupPath, backupPath);
+
+  if (pthread_create(&map->threads[0], NULL, inGame, map)) ERR("\nFailed to create a thread\n");
+  if (pthread_create(&map->threads[1], NULL, autosave, map)) ERR("\nFailed to create a thread\n");
+
+  if (pthread_join(map->threads[0], NULL)) ERR("\nFailed to join a thread!\n");
+  if (pthread_join(map->threads[1], NULL)) ERR("\nFailed to join a thread!\n"); 
 }
 
 void recursiveCreateMap(graph *map, char *path, int roomNumber, int *currentRooms) {
@@ -891,7 +966,6 @@ void recursiveCreateMap(graph *map, char *path, int roomNumber, int *currentRoom
   for (int i = 0; i < numberSub; i++) {
     if (isThereEdge(map, roomNumber, *currentRooms) == 0) {
       addEdge(map, roomNumber, *currentRooms);
-      printf("\nAdding edge between %d and %d\n", roomNumber, *currentRooms);
        curRoomsArr[i] = *currentRooms; // Saving all subdirectories (rooms) IDs
       *currentRooms += 1;
     }
@@ -914,7 +988,6 @@ void recursiveCreateMap(graph *map, char *path, int roomNumber, int *currentRoom
       entry=readdir(folder);
       stat(entry->d_name,&filestat);
       if( S_ISDIR(filestat.st_mode) ) {
-        printf("\nEntering: %s\n", entry->d_name);
         recursiveCreateMap(map, entry->d_name, curRoomsArr[i], currentRooms); // Entering each subdirectory
       }
   }
