@@ -77,7 +77,7 @@ void usage();
 
 // -- Graph (map) functions
 
-struct node* createNode(int); // Adding a node (room) to the graph (map)
+struct node* createNode(int v); // Adding a node (room) to the graph (map)
 struct Graph* createAGraph(int vertices); // Creating a graph (map)
 void addEdge(struct Graph* graph, int s, int d); // Adding an edge between nodes (door between rooms)
 void printGraph(struct Graph* graph); // Additional (unused) function to print whole graph and items info
@@ -232,6 +232,7 @@ void currentGameOutput(graph *map) {
 
 char* singlePathFromLine(char *line, char *command) {
   char *path = malloc(sizeof(char)*(strlen(line) - strlen(command)));
+  if (path == NULL) ERR("\nMalloc failed\n");
   int j = 0;
   for (int i = strlen(command) + 1; i < strlen(line) - 1; i++, j++) { // Storing path as a string
     path[j] = line[i];
@@ -242,6 +243,7 @@ char* singlePathFromLine(char *line, char *command) {
 
 char* pathDFromLine(char *line, char *command) {
   char *path_d  = malloc(sizeof(char)*(strlen(line) - strlen(command)));
+  if (path_d == NULL) ERR("\nMalloc failed\n");
   int j = 0;
   for (int i = strlen(command) + 1; i < strlen(line); i++, j++) {
     if (line[i] == ' ') break;
@@ -253,6 +255,7 @@ char* pathDFromLine(char *line, char *command) {
 
 char *pathFFromLine(char *line, char *path_d, char *command) {
   char *path_f = malloc(sizeof(char)*(strlen(line) - strlen(command) - strlen(path_d)));
+  if (path_f == NULL) ERR("\nMalloc failed\n");
   int j = 0;
   for (int i = strlen(command) + strlen(path_d) + 2; i < strlen(line) - 1; i++, j++) {
     path_f[j] = line[i];
@@ -263,6 +266,7 @@ char *pathFFromLine(char *line, char *path_d, char *command) {
 
 int singleIntFromLine(char *line, char *command) {
   char *num_string = malloc(sizeof(char)*strlen(line)-strlen(command));
+  if (num_string == NULL) ERR("\nMalloc failed\n");
   int num;
   strcpy(num_string, pathDFromLine(line, command));
   num = atoi(num_string);
@@ -306,7 +310,7 @@ void saveGame(graph *map, char *path) {
   for (int i = 0; i < map->numVertices; i++) {
     room *temp = map->adjLists[i];
     while(temp) {
-      fwrite(&temp->current_items, sizeof(temp->current_items), 1, map_file); // Current rooms in room[i]
+      fwrite(&temp->current_items, sizeof(temp->current_items), 1, map_file); // Current items in room[i]
       temp = temp->next;
     }
   }
@@ -336,6 +340,8 @@ graph *loadGame(char *path) { // Loading is performed in the same order, as data
   fread(&map->play, sizeof(player), 1, map_file);
 
   map->items = malloc(sizeof(item) * map->numItems);
+
+  if (map->items == NULL) ERR("\nMalloc failed\n");
 
   for (int i = 0; i < map->numItems; i++) {
     fread(&map->items[i], sizeof(map->items[i]), 1, map_file); 
@@ -380,10 +386,13 @@ void kThreadMethod(graph *gr, int threadAmount, int from_room, int to_room) {
 
   if (from_room == to_room) {printf("\nBut you are already in the room %d\n", from_room); return;}
 
-  if (to_room < 0 || to_room >= gr->numVertices) {printf("There is no such room on the map: %d", to_room); return;}
+  if (to_room < 0 || to_room >= gr->numVertices) {printf("\nThere is no such room on the map: %d\n", to_room); return;}
 
   path *paths = malloc(sizeof(path) * threadAmount);
   path *min_path = malloc(sizeof(path));
+
+  if (paths == NULL || min_path == NULL) ERR("\nMalloc failed\n");
+
   min_path->from_room = from_room;
   min_path->to_room = to_room;
   min_path->path_length = -1;
@@ -451,6 +460,9 @@ void kThreadMethod(graph *gr, int threadAmount, int from_room, int to_room) {
 void *findPath(void *voidPtr) {
   path *current_path = voidPtr;
   int *pos_leng = malloc(sizeof(int));
+
+  if (pos_leng == NULL) ERR("\nMalloc failed\n");
+
   int length_count = 0;
   int cur_room = current_path->from_room;
 
@@ -461,6 +473,8 @@ void *findPath(void *voidPtr) {
     if (cur_room == current_path->to_room) { *pos_leng = (int)length_count; return pos_leng; } // If we reach needed room, thread ends
     
     int *adj_rooms = malloc(sizeof(int) * numberAdjVertices(current_path->map, cur_room)); // Generating adjacent rooms
+    if (adj_rooms == NULL) ERR("\nMalloc failed\n");
+    
     room *temp = current_path->map->adjLists[cur_room];
     for (int j = 0; j < numberAdjVertices(current_path->map, cur_room); j++) {
       adj_rooms[j] = temp->vertex;
@@ -485,7 +499,7 @@ void *findPath(void *voidPtr) {
 void *autosave(void *arg) {
   graph *map = arg;
   while (1) {
-    struct timespec sec = {30, 0};
+    struct timespec sec = {60, 0};
     nanosleep(&sec, NULL);
     saveGame(map, map->backupPath);
   }
@@ -535,10 +549,10 @@ void *inGame(void *arg) {
 
       }
       else if (strncmp(command, save, strlen(save)) == 0) {
-        char *path = malloc(sizeof(path));
-        path = singlePathFromLine(command, save);
+        char *path = singlePathFromLine(command, save);
         printf("\n%s\n", path);
         saveGame(map, path);
+        free(path);
       }
       else if (strncmp(command, findPath, strlen(findPath)) == 0) {
         char *threadsChar = pathDFromLine(command, findPath);
@@ -548,6 +562,9 @@ void *inGame(void *arg) {
         int toRoom = atoi(toRoomChar);
 
         kThreadMethod(map, threadsAmount, map->play.currentRoom, toRoom);
+
+        free(threadsChar);
+        free(toRoomChar);
       }
       else if (strncmp(command, quit, strlen(quit)) == 0) {
         main_menu_ = 1;
@@ -622,6 +639,7 @@ void dropItem(graph *map, int item_number) {
 
 struct node* createNode(int v) {
   struct node* newNode = malloc(sizeof(struct node));
+  if (newNode == NULL) ERR("\nMalloc failed\n");
   newNode->vertex = v;
   newNode->next = NULL;
   return newNode;
@@ -629,6 +647,7 @@ struct node* createNode(int v) {
 
 struct Graph* createAGraph(int vertices) {
   struct Graph* graph = malloc(sizeof(struct Graph));
+  if (graph == NULL) ERR("\nMalloc failed\n");
   graph->numVertices = vertices;
   graph->numItems = floor((double)(3*graph->numVertices)/2);
   graph->numCorrectItems = 0;
@@ -715,8 +734,7 @@ int mainMenu(char *backupPath) {
   while(fgets(command, MAX_LINE+1, stdin)) { // Read the command
       if (strncmp(command, read_map, strlen(read_map)) == 0) { // Determine what command was written using strncmp
         
-        char *path = malloc(sizeof(path));
-        strcpy(path, singlePathFromLine(command, read_map));
+        char *path = singlePathFromLine(command, read_map);
 
         readMap(path, backupPath);
         free(path);
@@ -751,7 +769,7 @@ int mainMenu(char *backupPath) {
         char *path = singlePathFromLine(command, load_game);
         printf("\n%s123 \n%s123", backupPath, backupPath);
         startLoadGame(path, backupPath);
-        // free(path);
+        free(path);
       }
       else if (strncmp(command, exit, strlen(exit)) == 0) {
         return EXIT_SUCCESS;
@@ -798,6 +816,7 @@ void randMap(int n, char *path) {
   }
 
   map->items = malloc(sizeof(item) * map->numItems);
+  if (map->items == NULL) ERR("\nMalloc failed\n");
 
   int room_arr[map->numVertices * 2];
 
@@ -887,9 +906,10 @@ void mapFromDir(char *pathd, char *pathf) {
 
     recursiveCreateMap(map, pathd, 0, &currentRoomNumber);
 
-    chdir(cwd); // Returning to the initial directory (because recursive function above ends in some unpredictable directory)
+    if (chdir(cwd) == -1) ERR("\nFailed to return to initial directory\n"); // Returning to the initial directory (because recursive function above ends in some unpredictable directory)
 
     map->items = malloc(sizeof(item) * map->numItems);
+    if (map->items == NULL) ERR("\nMalloc failed\n");
 
     int room_arr[map->numVertices * 2];
 
@@ -938,7 +958,7 @@ void mapFromDir(char *pathd, char *pathf) {
   }
   
   printf("Created a map with [%d] rooms", map->numVertices);
-   saveGame(map, pathf);
+  saveGame(map, pathf);
 
 
 } 
@@ -991,8 +1011,8 @@ void recursiveCreateMap(graph *map, char *path, int roomNumber, int *currentRoom
         recursiveCreateMap(map, entry->d_name, curRoomsArr[i], currentRooms); // Entering each subdirectory
       }
   }
-  chdir(".."); // Return to parent directory
-  closedir(folder);
+  if (chdir("..")) ERR("Cannot open this path"); // Return to parent directory
+  if (closedir(folder))  ERR("closedir failed");
 }
 
 int walk(const char *name, const struct stat *s, int type, struct FTW *f)
